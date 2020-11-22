@@ -1,0 +1,390 @@
+#include "ads1118.h"
+
+/*
+32-Bit模式下CS引脚可以一直保持为低，节省一个IO口。
+32-Bit模式可以细分为两种，一种是把设置寄存器（16bit）写入两次，一种是写入一次后第二次（后16bit）写0。
+
+16-Bit模式要求在每两次通信之间CS（片选）引脚要拉高一次。
+每次通信可写入16bit的配置寄存器值和读取到16bit的转换寄存器值。
+*/
+
+uint16_t Conversion ;			// 存储从芯片读取的数据
+float Voltage ;    			// 存储需要显示的测量电压值
+float BaseV ;				// 采集电压的压基
+uint8_t firstflag ;				// 第一次进入标志
+uint8_t collect ;				// 每次采集的数据位置
+float DP[4] ;				// 显示处理后的八通道数据
+
+ConfigDef Config ;
+
+/*
+返回A_IN处测得的电流 可测量范围0~20A
+*/
+float temp;
+float ain_get_current(void)
+{
+	//使用前需要重新配置spi 如果已经配置过就不用重新配置
+	int i,j;
+	static uint8_t times=50;
+	temp=0;
+	for(i=0;i<times;i++){
+		ADS1118_GetVoltage_Fast(A_IN,V_4096,ADS1118_TS_MODE_ADC);
+		temp+=DP[0];
+	}
+	return temp;
+}
+
+/*
+返回V_IN处测得的电压 可测量范围-15~15v
+*/
+float vin_get_voltage(void)
+{
+	//使用前需要重新配置spi 如果已经配置过就不用重新配置
+	ADS1118_GetVoltage(V_IN,V_4096,ADS1118_TS_MODE_ADC);
+	float voltage = (float)((4273.0*DP[2]-7095.0)/473.0);
+	return voltage;
+}
+
+/*
+传入一个两位的数组
+*/
+void rin_get_ohm(uint32_t *R)
+{
+	//使用前需要重新配置spi 如果已经配置过就不用重新配置
+	GPIO_WriteBit(GPIOB,GPIO_Pin_1,Bit_SET);
+	ADS1118_GetVoltage(R_IN,V_4096,ADS1118_TS_MODE_ADC);
+	R[0]=(uint32_t)(1000000*DP[1]/(3.3f-DP[1])); //串联1Mohm 时测出的电阻
+	
+	GPIO_WriteBit(GPIOB,GPIO_Pin_1,Bit_RESET);
+	ADS1118_GetVoltage(R_IN,V_4096,ADS1118_TS_MODE_ADC);
+	R[1]=(uint32_t)(1000*DP[1]/(3.3f-DP[1]));		//串联1Kohm 时测出的电阻
+}
+
+uint16_t ADC_ConvertedValue;
+void cin_get_cap_init(void)
+{
+	GPIO_InitTypeDef GPIO_InitStructure;
+	ADC_InitTypeDef ADC_InitStructure;
+	ADC_CommonInitTypeDef ADC_CommonInitStructure;
+	DMA_InitTypeDef DMA_InitStructure;
+	TIM_TimeBaseInitTypeDef TIM_BaseInitStructure;
+	
+	//RCC_AHB1PeriphResetCmd(RCC_AHB1Periph_GPIOA,ENABLE);
+	//RCC_AHB1PeriphResetCmd(RCC_AHB1Periph_GPIOB,ENABLE);
+
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_ADC1,ENABLE);
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_DMA2,ENABLE);
+	
+	DMA_InitStructure.DMA_Channel = DMA_Channel_0;
+	DMA_InitStructure.DMA_DIR = DMA_DIR_PeripheralToMemory;
+	DMA_InitStructure.DMA_FIFOMode = DISABLE;
+	DMA_InitStructure.DMA_Priority = DMA_Priority_High;
+	DMA_InitStructure.DMA_Mode = DMA_Mode_Circular;
+	DMA_InitStructure.DMA_PeripheralBaseAddr = ( uint32_t ) ( & ( ADC1->DR ) );  //ADC->DR地址 //( uint32_t ) ( & ( ADC1->DR ) ); // (uint32_t)ADC1_BASE+0x4C;
+	DMA_InitStructure.DMA_Memory0BaseAddr = (uint32_t)&ADC_ConvertedValue;
+	DMA_InitStructure.DMA_BufferSize = 1;
+	DMA_InitStructure.DMA_PeripheralInc = DMA_PeripheralInc_Disable;
+	DMA_InitStructure.DMA_MemoryInc = DMA_MemoryInc_Disable; 
+	DMA_InitStructure.DMA_PeripheralDataSize = DMA_PeripheralDataSize_HalfWord;
+	DMA_InitStructure.DMA_MemoryDataSize = DMA_MemoryDataSize_HalfWord;
+	DMA_InitStructure.DMA_FIFOMode = DISABLE;
+	DMA_InitStructure.DMA_FIFOThreshold = DMA_FIFOThreshold_HalfFull;
+	DMA_InitStructure.DMA_PeripheralBurst = DMA_PeripheralBurst_Single;
+	DMA_InitStructure.DMA_MemoryBurst = DMA_MemoryBurst_Single;
+	DMA_Init(DMA2_Stream0, &DMA_InitStructure);
+	DMA_Cmd(DMA2_Stream0,ENABLE);
+	
+	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AN;
+	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_0;
+	GPIO_InitStructure.GPIO_PuPd = GPIO_PuPd_NOPULL;
+	GPIO_Init(GPIOA,&GPIO_InitStructure);
+	
+//	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_OUT;
+//	GPIO_InitStructure.GPIO_OType = GPIO_OType_PP;
+//	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_2;
+//	GPIO_InitStructure.GPIO_PuPd = GPIO_PuPd_DOWN;//GPIO_PuPd_NOPULL;
+//	GPIO_InitStructure.GPIO_Speed =GPIO_Speed_50MHz;
+//	GPIO_Init(GPIOB,&GPIO_InitStructure);
+
+	
+//	GPIO_InitStructure.GPIO_OType = GPIO_OType_OD;
+//	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_10;
+//	GPIO_Init(GPIOB,&GPIO_InitStructure);
+	
+	ADC_InitStructure.ADC_ContinuousConvMode = ENABLE;
+	ADC_InitStructure.ADC_DataAlign = ADC_DataAlign_Right;
+	ADC_InitStructure.ADC_ExternalTrigConvEdge  = ADC_ExternalTrigConvEdge_None; 
+	ADC_InitStructure.ADC_NbrOfConversion = 1;
+	ADC_InitStructure.ADC_Resolution = ADC_Resolution_12b;
+	ADC_InitStructure.ADC_ScanConvMode = DISABLE;
+	ADC_Init(ADC1, &ADC_InitStructure);
+	ADC_RegularChannelConfig(ADC1,ADC_Channel_0,1,ADC_SampleTime_56Cycles);
+	
+	ADC_CommonInitStructure.ADC_DMAAccessMode = ENABLE;
+	ADC_CommonInitStructure.ADC_Mode = ADC_Mode_Independent;
+	ADC_CommonInitStructure.ADC_Prescaler = ADC_Prescaler_Div8;
+	ADC_CommonInitStructure.ADC_TwoSamplingDelay = ADC_TwoSamplingDelay_5Cycles;
+	ADC_CommonInit(&ADC_CommonInitStructure);
+	
+	//ADC_ContinuousModeCmd(ADC1,ENABLE);
+	
+	ADC_DMARequestAfterLastTransferCmd(ADC1, ENABLE);
+	ADC_Cmd(ADC1, ENABLE);	//使能指定的ADC1z
+	ADC_DMACmd(ADC1, ENABLE);
+	ADC_SoftwareStartConv(ADC1);
+	
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_TIM10,ENABLE);
+	TIM_BaseInitStructure.TIM_CounterMode = TIM_CounterMode_Up;
+	TIM_BaseInitStructure.TIM_Period = 65535;
+	TIM_BaseInitStructure.TIM_Prescaler = 0;
+	TIM_BaseInitStructure.TIM_ClockDivision=0;
+	TIM_TimeBaseInit(TIM10, &TIM_BaseInitStructure);
+	
+	TIM_PrescalerConfig(TIM10, 99, TIM_PSCReloadMode_Immediate);
+	
+	TIM_Cmd(TIM10, ENABLE);
+	
+}
+
+float cin_get_cap(void)
+{
+	float cap,voltage;
+	uint16_t val;
+  GPIO_ResetBits(GPIOB, GPIO_Pin_10);
+	GPIO_ResetBits(GPIOB, GPIO_Pin_2);
+	delay_ms(100);
+	GPIO_WriteBit(GPIOB,GPIO_Pin_10,Bit_SET);
+	GPIO_WriteBit(GPIOB,GPIO_Pin_2,Bit_SET);
+	TIM10->CNT = 0;
+	while(((float)(ADC_ConvertedValue/4096.0*3.3))<=1.94);//2.041
+	val = TIM10->CNT;
+	cap = (float)val/100000.0;
+	GPIO_WriteBit(GPIOB,GPIO_Pin_10,Bit_RESET);
+	GPIO_WriteBit(GPIOB,GPIO_Pin_2,Bit_RESET);
+	return cap;
+}
+
+uint8_t SPI_ReadWriteByte(uint8_t TxData)
+{		
+	uint8_t retry=0;				 	
+	while (SPI_I2S_GetFlagStatus(HSPI, SPI_I2S_FLAG_TXE) == RESET) //检查指定的SPI标志位设置与否:发送缓存空标志位
+	{
+		retry++;
+		if(retry>200)return 0;
+	}			  
+	SPI_I2S_SendData(HSPI, TxData); //通过外设SPIx发送一个数据
+	retry=0;
+
+	while (SPI_I2S_GetFlagStatus(HSPI, SPI_I2S_FLAG_RXNE) == RESET) //检查指定的SPI标志位设置与否:接受缓存非空标志位
+	{
+		retry++;
+		if(retry>200)return 0;
+	}	  						    
+	return SPI_I2S_ReceiveData(HSPI); //返回通过SPIx最近接收的数据					    
+}
+
+
+void ADS1118GPIOInit(void)
+{
+	GPIO_InitTypeDef GPIO_InitStructure;
+
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOB,ENABLE);
+
+	GPIO_InitStructure.GPIO_Pin = ADS_CS_PIN;
+	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_OUT;
+	GPIO_InitStructure.GPIO_PuPd = GPIO_PuPd_NOPULL;
+	GPIO_InitStructure.GPIO_Speed = GPIO_Medium_Speed;
+	GPIO_InitStructure.GPIO_OType = GPIO_OType_PP;
+	GPIO_Init(ADS_CS_PORT,&GPIO_InitStructure);
+
+	GPIO_SetBits(ADS_CS_PORT,ADS_CS_PIN);
+}
+											
+// 当新数据准备好检索时，此引脚变为低电平
+// 在连续转换模式下，如果未从器件中检索到任何数据，则DOUT / DRDY在下一个数据就绪信号（DOUT / DRDY为低电平）之前的8 μs再次变为高电平
+/**********************************************************
+函数名称：SPI_Read_Write_16b
+函数功能：SPI发送接收数据
+函数参数：需要配置的寄存器数据
+函数返回：采集到的16位数据
+函数隶属：Display
+创建日期：2020/04/17  14：23
+作    者：Jerry
+注    解：
+**********************************************************/
+uint16_t SPI_Read_Write_16b(uint16_t DATA)
+{
+    uint8_t Tdata[2];
+    uint8_t Rdata[2];
+    uint16_t temp;
+	
+    Tdata[0]=(uint8_t)(DATA>>8);
+    Tdata[1]=(uint8_t)(DATA);
+	
+		Rdata[0]=SPI_ReadWriteByte(Tdata[0]);
+		Rdata[1]=SPI_ReadWriteByte(Tdata[1]);
+	
+    temp=((uint16_t)Rdata[0]<<8) | (uint16_t)Rdata[1];
+    return temp;
+}
+
+/**********************************************************
+函数名称：ADS1118Init
+函数功能：初始化时配置一些不常改变的寄存器值
+函数参数：单次转换，工作模式，传输速率，上拉使能，更新数据
+函数返回：无
+函数隶属：main
+创建日期：2020/04/17  14：23
+作    者：Jerry
+注    解：
+**********************************************************/
+void ADS1118_Init(uint8_t ss,uint8_t mode ,uint8_t dr,uint8_t pue,uint8_t nop)
+{
+	Config.ConfigDef_T.SS = ss ;				// 设置为无效果
+	Config.ConfigDef_T.MODE = mode ;			// 设置为连续转换模式
+	Config.ConfigDef_T.DR = dr ;				// 设置转换速率为128 SPS
+	Config.ConfigDef_T.PULL_UP_EN = pue ;		// 设置DOUT上拉使能
+	Config.ConfigDef_T.NOP = nop ;				// 设置有效数据，更新配置寄存器
+	Config.ConfigDef_T.CNV_RDY_FL = 0x01 ;		// 保留位，始终写1	
+	
+	Conversion = 0  ;			
+	Voltage = 0  ;    			
+	BaseV = 0  ;
+	firstflag = 0 ;
+}
+
+/**********************************************************
+函数名称：Getdata
+函数功能：配置寄存器值并连续采集五次数据求平均值
+函数参数：通道选择，工作模式，传输速率，上拉使能，更新数据
+函数返回：无
+函数隶属：main
+创建日期：2020/04/17  14：23
+作    者：Jerry
+注    解：
+**********************************************************/
+void ADS1118_GetVoltage(uint8_t mux,uint8_t pga,uint8_t tsmode)
+{
+	float FV[10] ;			// 存储连续的五次转换数据
+	uint8_t t ;
+	float displaydata ;
+	
+	Config.ConfigDef_T.MUX = mux ;				// 设置为AIN0和GND
+	Config.ConfigDef_T.PGA = pga ;				// 设置FSR=±4.096V
+	Config.ConfigDef_T.TS_MODE = tsmode ;		// 设置温度传感器模式为ADC模式	
+								
+	switch (pga)
+	{
+		case 0 :
+			BaseV = 187.5 ;						// 压基单位为uV
+			break ;
+		case 1 :
+			BaseV = 125 ;
+			break ;
+		case 2 :
+			BaseV = 62.5 ;
+			break ;
+		case 3 :
+			BaseV = 31.25 ;
+			break ;
+		case 4 :
+			BaseV = 15.625 ;
+			break ;
+		case 5 :
+			BaseV = 7.8125 ;
+			break ;
+	}
+	for(t=0;t<5;t++)
+	{
+    ADS1118_ENABLE;
+		delay_ms(1);
+		if((GPIO_ReadInputDataBit(SPI_MASTER_GPIO,SPI_MASTER_PIN_MISO) == 0)||(firstflag == 0))									// CS需要周期性拉低来检测是否有新的数据产生(检测INPUT引脚是否有低电平)							
+		{
+			Conversion = SPI_Read_Write_16b(Config.Bytes);
+			Voltage = (BaseV*Conversion)/1000000 ;			// 转换单位：uV→V	
+			Conversion = 0 ;							// 数据显示之后清零	
+			firstflag = 1 ;
+		}
+
+    ADS1118_DISABLE;
+		FV[t] = Voltage ;
+		delay_ms(15);									// 延迟时间不能低于15ms
+	}
+	displaydata = (FV[1]+FV[2]+FV[3]+FV[4] )/4;
+		switch(mux)
+		{
+			case ADS1118_MUX_0G:
+				DP[0] = displaydata ;
+				break ;
+			case ADS1118_MUX_1G:
+				DP[1] = displaydata ;
+				break ;
+			case ADS1118_MUX_2G:
+				DP[2] = displaydata ;
+				break ;
+			case ADS1118_MUX_3G:
+				DP[3] = displaydata ;
+				break ;
+		}
+}
+
+void ADS1118_GetVoltage_Fast(uint8_t mux,uint8_t pga,uint8_t tsmode)
+{
+	uint8_t t ;
+	float displaydata ;
+	
+	Config.ConfigDef_T.MUX = mux ;				// 设置为AIN0和GND
+	Config.ConfigDef_T.PGA = pga ;				// 设置FSR=±4.096V
+	Config.ConfigDef_T.TS_MODE = tsmode ;		// 设置温度传感器模式为ADC模式	
+								
+	switch (pga)
+	{
+		case 0 :
+			BaseV = 187.5 ;						// 压基单位为uV
+			break ;
+		case 1 :
+			BaseV = 125 ;
+			break ;
+		case 2 :
+			BaseV = 62.5 ;
+			break ;
+		case 3 :
+			BaseV = 31.25 ;
+			break ;
+		case 4 :
+			BaseV = 15.625 ;
+			break ;
+		case 5 :
+			BaseV = 7.8125 ;
+			break ;
+	}
+	
+    ADS1118_ENABLE;
+		delay_ms(1);
+		if((GPIO_ReadInputDataBit(SPI_MASTER_GPIO,SPI_MASTER_PIN_MISO) == 0)||(firstflag == 0))									// CS需要周期性拉低来检测是否有新的数据产生(检测INPUT引脚是否有低电平)							
+		{
+			Conversion = SPI_Read_Write_16b(Config.Bytes);
+			Voltage = (BaseV*Conversion)/1000000 ;			// 转换单位：uV→V	
+			Conversion = 0 ;							// 数据显示之后清零	
+			firstflag = 1 ;
+		}
+    ADS1118_DISABLE;
+		switch(mux)
+		{
+			case ADS1118_MUX_0G:
+				DP[0] = Voltage ;
+				break ;
+			case ADS1118_MUX_1G:
+				DP[1] = Voltage ;
+				break ;
+			case ADS1118_MUX_2G:
+				DP[2] = Voltage ;
+				break ;
+			case ADS1118_MUX_3G:
+				DP[3] = Voltage ;
+				break ;
+		}
+}
+
+
+

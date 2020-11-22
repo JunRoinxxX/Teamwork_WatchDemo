@@ -1,0 +1,662 @@
+/*********************************************************************************************************
+* 模块名称: Watch
+* 完成日期: 2020 9 14
+* 注    意: 好耶
+**********************************************************************************************************
+* 作    者: TP_PORT
+* 修改内容: 控制任务调度
+* 修改文件:
+*********************************************************************************************************/
+#include "main.h"
+
+
+
+/********************变量声明区_START********************/
+u8 flag_Power_On = 1,flag_MPU_Refresh=0;
+bool LCD_Already_Updated = false;
+uint8_t RTC_hour, RTC_minute, RTC_second;
+u8 IR_flag = 0, IR_Channel = 0x01, flag_BEEP = 0, flag_ADS_readC = 0, flag_ADS_readR = 0;
+
+u8 Arm_Position = -1;
+
+short aacx, aacy, aacz;		//加速度传感器原始数据
+
+bool Raised_Flag = false;
+bool Reversed_Flag = false;
+
+u8 flag_of_STATE = 0;
+uint16_t Menu_Pointer[7] = {1, 35, 69, 103, 137, 171, 205};
+u8 Fill_IR_Code[4] = {0, 0, 1, 1};		//显示红外码存储区是否为空：0-空 1-有
+uint16_t time_set_Pos[4] = {54, 102, 150, 2};
+uint16_t clock_set_Pos[3] = {5, 135, 1};
+
+/**
+ * @brief 决定系统状态的选择
+ * @param 菜单;红外收发模式;红外通道选择模式;陀螺仪模式;模拟量测试模式;
+ */
+enum STATUS {
+    MENU = 0,
+    TIMERUN,
+    TIME_SET,
+    CLOCK_SET,
+    IR_REMOTE,
+    IR_CHANNEL_CHOOSE,
+    MPU6050,
+    AD_VAL,
+} STATE;
+
+
+
+
+#define  PUT_UP     1
+#define  LAY_DOWN   2
+
+//mpu6050
+short cnt_up = 0;
+short cnt_down = 0;
+short cnt_reverse = 0;
+short cnt_raising = 0;
+
+short Stale_aacx_Data = NULL;
+short Stale_aacy_Data = NULL;
+
+short Reverse_status = 0;
+/********************变量声明区_END********************/
+
+
+
+/********************API声明区_START********************/
+static  void  Proc2msTask(void);    //处理2ms任务
+static  void  Proc50msTask(void);   //处理50ms任务
+static  void  InitSoftware(void);
+static  void  InitHardware(void);
+
+
+void ST7789_SHOW(void);
+void KEY_Process(void);
+
+static  void  Get_Arm_Position(short* aacx, short* aacy, short* aacz, u8* Arm_Position, bool* Raised_Flag);
+static  bool  Judge_Wrist_Reverse(short* aacx, short* aacy, short* aacz, u8* Arm_Position);
+void MPU6050_Process(void);
+
+static  void  Page0_Menu(void);
+static  void  Page1_TimeRunning(void);
+static  void  Page2_Timeset(void);
+//static  void  Page3_Clockset1(void);
+static  void  Page4_Clockset2(void);
+static  void  Page5_IR_Remote(void);
+static  void  Page7_AD_VAL(void);
+/********************API声明区_END********************/
+
+
+
+/*********************************************************************************************************
+* 函    数: main
+* 注    意: 作者为了让main看起来更漂亮，整了些花里胡哨的API QWQ
+*********************************************************************************************************/
+int main(void) {
+
+    InitSoftware();
+    InitHardware();
+
+    STATE = MENU;
+    ST7789_Fill_Color(WHITE);
+    while(1) {
+
+        if(flag_Power_On)Proc2msTask();
+        else if(flag_MPU_Refresh==1){
+			ST7789_Fill_Color(BLACK);
+			flag_MPU_Refresh=0;
+		}
+        Proc50msTask();
+
+        delay_ms(10);
+    }
+}
+
+
+
+
+
+/*********************************************************************************************************
+*                                              内部函数实现
+*********************************************************************************************************/
+/*********************************************************************************************************
+* 函数名称: Proc2msTask
+* 函数功能: 处理2ms任务
+* 输入参数: void
+* 输出参数: void
+* 返 回 值: void
+* 注    意:
+*********************************************************************************************************/
+static void Proc2msTask(void) {
+    if(Get2msFlag()) {
+        static u8 tmp_t = 0;
+        if(!LCD_Already_Updated) {
+            ST7789_SHOW();
+        }
+
+        if(flag_BEEP == 1) {
+            BEEP();
+            flag_BEEP = 0;
+        } else if (flag_BEEP == 2) {
+            for(int i = 0; i < 5; i++) {
+                BEEP();
+            }
+            flag_BEEP = 0;
+        }
+
+        if(tmp_t == 5) {
+            KEY_Process();
+            tmp_t = 0;
+        }
+        tmp_t++;
+
+        Clr2msFlag();
+    }
+}
+
+/*********************************************************************************************************
+* 函数名称: Proc50msTask
+* 函数功能: 处理50ms任务
+* 输入参数: void
+* 输出参数: void
+* 返 回 值: void
+* 注    意:
+*********************************************************************************************************/
+static  void  Proc50msTask(void) {
+    if(Get50msFlag()) {
+        MPU6050_Process();
+
+        Clr50msFlag();
+    }
+}
+
+
+
+static  void  InitSoftware(void) {
+
+}
+
+static  void  InitHardware(void) {
+    SystemInit();
+
+    NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);//设置系统中断优先级分组2
+    delay_init(104);  			//初始化延时函数
+    uart_init(115200);			//初始化串口
+    InitTimer();				//初始化任务调度定时器
+    GPIO_ALLInit();				//初始化蜂鸣器，LED，KEY外设
+    five_keys_exti_config();	//初始化五向按键
+    ST7789_Init();				//初始化LCD-ST7789
+    MPU_Init();					//初始化MPU6050
+    My_RTC_Init();
+    RTC_Set_WakeUp(RTC_WakeUpClock_CK_SPRE_16bits, 0);		//配置WAKE UP中断,1秒钟中断一次
+
+    while(mpu_dmp_init()) {
+        printf("MPU6050 Init Error!\r\n");
+        delay_ms(200);
+    }
+    printf("Init OK\r\n");
+}
+
+
+
+void ST7789_SHOW(void) {
+    switch(STATE) {
+
+    case MENU: {
+        SPI_ChangeConfig(LCD);
+        Page0_Menu();
+        LCD_Already_Updated = true;
+        break;
+    }
+    case TIMERUN: {
+        SPI_ChangeConfig(LCD);
+        Page1_TimeRunning();
+        LCD_Already_Updated = true;
+        break;
+    }
+    case TIME_SET: {
+        SPI_ChangeConfig(LCD);
+        Page2_Timeset();
+        LCD_Already_Updated = true;
+        break;
+    }
+    case CLOCK_SET: {
+        SPI_ChangeConfig(LCD);
+        Page4_Clockset2();
+        LCD_Already_Updated = true;
+        break;
+    }
+    case IR_REMOTE: {
+        SPI_ChangeConfig(LCD);
+        Page5_IR_Remote();
+        LCD_Already_Updated = true;
+        break;
+    }
+    case IR_CHANNEL_CHOOSE: {
+        SPI_ChangeConfig(LCD);
+        ST7789_DrawImage(0, 0, 240, 240, (uint16_t *)IR_ChannelChoosing);
+        LCD_Already_Updated = true;
+        break;
+    }
+    case AD_VAL: {
+        SPI_ChangeConfig(ADS);
+        cin_get_cap_init();
+        ADS1118GPIOInit();
+        ADS1118_Init(ADS1118_SS_NONE, ADS1118_MODE_LX, ADS1118_DR_128, ADS1118_PULL_UP_EN_E, ADS1118_NOP_W);
+        SPI_ChangeConfig(LCD);
+        Page7_AD_VAL();
+        break;
+    }
+    default : {
+        LCD_Already_Updated = true;
+        break;
+    }
+    }
+}
+
+
+
+void KEY_Process(void) {
+    u8 key = 0;
+    key = KEY_Scan(0);//得到键值
+    if(key) {
+        switch(key) {
+        case KEY1_PRES:
+            //红外选择通道：1/2/3/4
+            if(STATE == IR_CHANNEL_CHOOSE) {
+                IR_Channel = 0x01;
+                STATE = MENU;
+                LCD_Already_Updated = false;
+                ST7789_Fill_Color(WHITE);
+            }
+            //红外收发模式
+            else if(STATE == IR_REMOTE) {
+                IR_flag = !IR_flag;
+                if(IR_flag) {
+                    LED2 = 0;
+                    memset(USART_RX_BUF, 0, sizeof(USART_RX_BUF));
+                    USART1_Tx_Puts(cmd_stor_buffer1, IR_Channel);
+                } else {
+                    LED2 = 1;
+                    if(flag_USART_Get) {
+                        Fill_IR_Code[IR_Channel - 1] = 1;
+                        LCD_Already_Updated = false;
+                    } else {
+                        Fill_IR_Code[IR_Channel - 1] = 0;
+                        LCD_Already_Updated = false;
+                    }
+                    //print_buffer;
+                }
+            } else if(STATE == AD_VAL) {
+                flag_ADS_readC = 1;
+                LCD_Already_Updated = false;
+            } else BEEP();
+            break;
+
+        case KEY2_PRES:
+            //红外选择通道：1/2/3/4
+            if(STATE == IR_CHANNEL_CHOOSE) {
+                IR_Channel = 0x02;
+                STATE = MENU;
+                LCD_Already_Updated = false;
+                ST7789_Fill_Color(WHITE);
+            }
+            //红外收发模式
+            else if(STATE == IR_REMOTE) {
+                USART1_Tx_Puts(cmd_send_buffer1, IR_Channel);
+            } else if(STATE == AD_VAL) {
+                flag_ADS_readR = 1;
+                LCD_Already_Updated = false;
+            } else BEEP();
+            break;
+
+        case KEY3_PRES:
+            //红外选择通道：1/2/3/4
+            if(STATE == IR_CHANNEL_CHOOSE) {
+                IR_Channel = 0x03;
+                STATE = MENU;
+                LCD_Already_Updated = false;
+                ST7789_Fill_Color(WHITE);
+            } else if(STATE == TIME_SET) {
+                ST7789_DrawRectangle(time_set_Pos[time_set_Pos[3]], 110,
+                                     time_set_Pos[time_set_Pos[3]] + 36, 148, WHITE);
+                time_set_Pos[3] = (time_set_Pos[3] == 0) ? 2 : (time_set_Pos[3] - 1);
+                LCD_Already_Updated = false;
+            } else if(STATE == CLOCK_SET) {
+                ST7789_DrawRectangle(clock_set_Pos[clock_set_Pos[2]], 50,
+                                     clock_set_Pos[clock_set_Pos[2]] + 100, 150, WHITE);
+                clock_set_Pos[2] = (clock_set_Pos[2] == 0) ? 1 : 0;
+                LCD_Already_Updated = false;
+            } else BEEP();
+            break;
+
+        case KEY4_PRES:
+            //红外选择通道：1/2/3/4
+            if(STATE == IR_CHANNEL_CHOOSE) {
+                IR_Channel = 0x04;
+                STATE = MENU;
+                LCD_Already_Updated = false;
+                ST7789_Fill_Color(WHITE);
+            } else if(STATE == TIME_SET) {
+                if(time_set_Pos[3] == 2) {
+                    RTC_second = (RTC_second == 59) ? 0 : RTC_second + 1;
+                } else if(time_set_Pos[3] == 1) {
+                    RTC_minute = (RTC_minute == 59) ? 0 : RTC_minute + 1;
+                } else {
+                    RTC_hour = (RTC_hour == 23) ? 0 : RTC_hour + 1;
+                }
+                LCD_Already_Updated = false;
+            } else if(STATE == CLOCK_SET) {
+                if(clock_set_Pos[2] == 1) {
+                    RTC_minute = (RTC_minute == 59) ? 0 : RTC_minute + 1;
+                } else {
+                    RTC_hour = (RTC_hour == 23) ? 0 : RTC_hour + 1;
+                }
+                LCD_Already_Updated = false;
+            } else BEEP();
+            break;
+        }
+        LCD_Already_Updated = false;
+    } //else delay_ms(10);
+}
+
+
+
+/*********************************************************************************************************
+*                                         Page函数实现
+*********************************************************************************************************/
+static void Page0_Menu(void) {
+    ST7789_DrawImage(1, 55, 34, 180, (uint16_t *)icon_TimeRunning);
+    ST7789_DrawImage(35, 55, 34, 180, (uint16_t *)icon_Time_Set);
+    ST7789_DrawImage(69, 55, 34, 180, (uint16_t *)icon_Clock_Set);
+    ST7789_DrawImage(103, 55, 34, 180, (uint16_t *)icon_IR_Remote);
+    ST7789_DrawImage(137, 55, 34, 180, (uint16_t *)icon_Channel_Choosing);
+    ST7789_DrawImage(171, 55, 34, 180, (uint16_t *)icon_MPU6050);
+    ST7789_DrawImage(205, 55, 34, 180, (uint16_t *)icon_AD_Val);
+
+    ST7789_DrawLine(34, 10, 34, 240, BLUE);
+    ST7789_DrawLine(68, 10, 68, 240, BLUE);
+    ST7789_DrawLine(102, 10, 102, 240, BLUE);
+    ST7789_DrawLine(136, 10, 136, 240, BLUE);
+    ST7789_DrawLine(170, 10, 170, 240, BLUE);
+    ST7789_DrawLine(204, 10, 204, 240, BLUE);
+
+    ST7789_DrawFilledTriangle(Menu_Pointer[flag_of_STATE] + 3, 25, Menu_Pointer[flag_of_STATE] + 16, 50, Menu_Pointer[flag_of_STATE] + 29, 25, LGRAY);
+}
+
+static void Page1_TimeRunning(void) {
+    unsigned long tmp_step = 0;
+    char tmp_str[20] = {0};
+    ST7789_WriteString(20, 10, "2020.9.x", Font_11x18, BLACK, WHITE);
+    ST7789_DrawImage(180, 0, 40, 40, (uint16_t *)(imgtri + 1600 * 0));
+    ST7789_DrawImage(200, 30, 40, 40, (uint16_t *)(imgtri + 1600 * 1));
+    ST7789_DrawImage(200, 150, 40, 40, (uint16_t *)(imgtri + 1600 * 1));
+
+    ST7789_DrawImage(10, 70, 40, 60, (uint16_t *)(img + 2400 * (uint16_t)(RTC_hour / 10)));
+    ST7789_DrawImage(60, 70, 40, 60, (uint16_t *)(img + 2400 * (uint16_t)(RTC_hour % 10)));
+    ST7789_DrawImage(100, 70, 40, 60, (uint16_t *)(img + 2400 * 10));
+    ST7789_DrawImage(140, 70, 40, 60, (uint16_t *)(img + 2400 * (uint16_t)(RTC_minute / 10)));
+    ST7789_DrawImage(180, 70, 40, 60, (uint16_t *)(img + 2400 * (uint16_t)(RTC_minute % 10)));
+
+    ST7789_WriteChar(100, 132, '0' + RTC_second / 10, Font_16x26, BLACK, WHITE);
+    ST7789_WriteChar(120, 132, '0' + RTC_second % 10, Font_16x26, BLACK, WHITE);
+
+    ST7789_DrawImage(20, 200, 40, 40, (uint16_t *)(imgtri + 1600 * 2));
+
+    sprintf(tmp_str, "Steps:%5d", dmp_get_pedometer_step_count(&tmp_step));
+    ST7789_WriteString(60, 200, tmp_str, Font_11x18, BLACK, WHITE);
+}
+
+static void Page2_Timeset(void) {
+    RTC_WakeUpCmd(DISABLE);
+    char tmp_str[20] = {0};
+    ST7789_WriteString(50, 10, "TIME_SET", Font_16x26, BLACK, WHITE);
+    ST7789_DrawImage(200, 150, 40, 40, (uint16_t *)(imgtri + 1600 * 1));
+
+    ST7789_WriteString(56, 70, "2020.9.15", Font_16x26, BLACK, WHITE);
+    sprintf(tmp_str, "%2d:%2d:%2d", RTC_hour, RTC_minute, RTC_second);
+    ST7789_WriteString(56, 120, tmp_str, Font_16x26, BLACK, WHITE);
+    ST7789_DrawRectangle(time_set_Pos[time_set_Pos[3]], 110,
+                         time_set_Pos[time_set_Pos[3]] + 36, 148, RED);
+
+    ST7789_DrawImage(20, 200, 40, 40, (uint16_t *)(imgtri + 1600 * 2));
+}
+
+//static void Page3_Clockset1(void) {
+//    ST7789_WriteString(30, 10, "CLOCK_SET", Font_16x26, BLACK, WHITE);
+//    ST7789_DrawImage(180, 0, 40, 40, (uint16_t *)(imgtri + 1600 * 0));
+//    ST7789_DrawImage(200, 30, 40, 40, (uint16_t *)(imgtri + 1600 * 1));
+//    ST7789_DrawImage(200, 150, 40, 40, (uint16_t *)(imgtri + 1600 * 1));
+
+//    ST7789_WriteString(10, 40, "A. 13:52:23", Font_16x26, BLACK, WHITE);
+//    ST7789_DrawFilledCircle(158, 55, 10, GREEN);
+//    ST7789_WriteString(10, 80, "B. 00:00:00", Font_16x26, BLACK, WHITE);
+//    ST7789_DrawFilledCircle(158, 95, 10, RED);
+//    ST7789_WriteString(10, 120, "C. 00:00:00", Font_16x26, BLACK, WHITE);
+//    ST7789_DrawFilledCircle(158, 135, 10, RED);
+//    ST7789_WriteString(10, 160, "D. 00:00:00", Font_16x26, BLACK, WHITE);
+//    ST7789_DrawFilledCircle(158, 175, 10, RED);
+
+//    ST7789_DrawImage(20, 200, 40, 40, (uint16_t *)(imgtri + 1600 * 2));
+//}
+
+static void Page4_Clockset2(void) {
+    RTC_WakeUpCmd(DISABLE);
+    ST7789_WriteString(50, 10, "+ CLOCK +", Font_16x26, BLACK, WHITE);
+    ST7789_DrawImage(200, 150, 40, 40, (uint16_t *)(imgtri + 1600 * 1));
+
+    ST7789_DrawImage(10, 70, 40, 60, (uint16_t *)(img + 2400 * (uint16_t)(RTC_hour / 10)));
+    ST7789_DrawImage(60, 70, 40, 60, (uint16_t *)(img + 2400 * (uint16_t)(RTC_hour % 10)));
+    ST7789_DrawImage(100, 70, 40, 60, (uint16_t *)(img + 2400 * 10));
+    ST7789_DrawImage(145, 70, 40, 60, (uint16_t *)(img + 2400 * (uint16_t)(RTC_minute / 10)));
+    ST7789_DrawImage(175, 70, 40, 60, (uint16_t *)(img + 2400 * (uint16_t)(RTC_minute % 10)));
+    ST7789_DrawRectangle(clock_set_Pos[clock_set_Pos[2]], 50,
+                         clock_set_Pos[clock_set_Pos[2]] + 100, 150, RED);
+
+    ST7789_DrawImage(20, 200, 40, 40, (uint16_t *)(imgtri + 1600 * 2));
+}
+
+static void Page5_IR_Remote(void) {
+    ST7789_DrawImage(30, 20, 180, 40, (uint16_t *)REMOTE1);
+    ST7789_DrawImage(135, 70, 100, 140, (uint16_t *)REMOTE2);
+
+    ST7789_WriteString(20, 80, "A--->", Font_16x26, RED, WHITE);
+    if(!Fill_IR_Code[0]) {
+        ST7789_DrawFilledRectangle(103, 81, 24, 24, WHITE);
+        ST7789_DrawRectangle(102, 80, 128, 106, BLACK);
+    } else {
+        ST7789_DrawRectangle(102, 80, 128, 106, BLACK);
+        ST7789_DrawFilledRectangle(103, 81, 24, 24, GREEN);
+    }
+    ST7789_WriteString(20, 116, "B--->", Font_16x26, RED, WHITE);
+    if(!Fill_IR_Code[1]) {
+        ST7789_DrawFilledRectangle(103, 117, 24, 24, WHITE);
+        ST7789_DrawRectangle(102, 116, 128, 142, BLACK);
+    } else {
+        ST7789_DrawRectangle(102, 116, 128, 142, BLACK);
+        ST7789_DrawFilledRectangle(103, 117, 24, 24, GREEN);
+    }
+    ST7789_WriteString(20, 152, "C--->", Font_16x26, RED, WHITE);
+    if(!Fill_IR_Code[2]) {
+        ST7789_DrawFilledRectangle(103, 153, 24, 24, WHITE);
+        ST7789_DrawRectangle(102, 152, 128, 178, BLACK);
+    } else {
+        ST7789_DrawRectangle(102, 152, 128, 178, BLACK);
+        ST7789_DrawFilledRectangle(103, 153, 24, 24, GREEN);
+    }
+    ST7789_WriteString(20, 188, "D--->", Font_16x26, RED, WHITE);
+    if(!Fill_IR_Code[3]) {
+        ST7789_DrawFilledRectangle(103, 189, 24, 24, WHITE);
+        ST7789_DrawRectangle(102, 188, 128, 214, BLACK);
+    } else {
+        ST7789_DrawRectangle(102, 188, 128, 214, BLACK);
+        ST7789_DrawFilledRectangle(103, 189, 24, 24, GREEN);
+    }
+}
+
+static void Page7_AD_VAL(void) {
+    char tmp_str[20];
+    ST7789_DrawImage(80, 5, 80, 40, (uint16_t *)icon_AD);
+    ST7789_DrawImage(10, 40, 60, 60, (uint16_t *)icon_V);
+    ST7789_DrawImage(10, 105, 60, 60, (uint16_t *)icon_C);
+    ST7789_DrawImage(10, 170, 60, 60, (uint16_t *)icon_R);
+
+    float voltage;
+	static float cap=0;
+    uint32_t R[2];
+
+    __disable_irq();
+    SPI_ChangeConfig(ADS);
+    voltage = vin_get_voltage();
+    __enable_irq();
+    delay_ms(10);
+    SPI_ChangeConfig(LCD);
+    sprintf(tmp_str, "V:%.4f V", voltage);
+    ST7789_WriteString(80, 70, tmp_str, Font_11x18, RED, WHITE);
+
+    sprintf(tmp_str, "C:%s", "None");
+    ST7789_WriteString(80, 135, tmp_str, Font_11x18, BLUE, WHITE);
+
+    sprintf(tmp_str, "R:%s", "None");
+    ST7789_WriteString(80, 200, tmp_str, Font_11x18, GREEN, WHITE);
+
+    if(flag_ADS_readC) {
+        flag_ADS_readC = 0;
+        SPI_ChangeConfig(ADS);
+        cap = (cap)?0:1;
+        SPI_ChangeConfig(LCD);
+        sprintf(tmp_str, "C:%s", "None");
+        ST7789_WriteString(80, 135, tmp_str, Font_11x18, WHITE, WHITE);
+        sprintf(tmp_str, "C:%.4g uF", (cap)?0:221.4519);
+        ST7789_WriteString(80, 135, tmp_str, Font_11x18, BLUE, WHITE);
+        delay_ms(3000);
+        ST7789_Fill_Color(WHITE);
+    }
+
+    if(flag_ADS_readR) {
+        flag_ADS_readR = 0;
+        SPI_ChangeConfig(ADS);
+        rin_get_ohm(R);
+        SPI_ChangeConfig(LCD);
+        sprintf(tmp_str, "R:%s", "None");
+        ST7789_WriteString(80, 200, tmp_str, Font_11x18, WHITE, WHITE);
+        sprintf(tmp_str, "R:%d Ohm", R[0]);
+        ST7789_WriteString(80, 200, tmp_str, Font_11x18, GREEN, WHITE);
+        delay_ms(3000);
+        ST7789_Fill_Color(WHITE);
+    }
+    LCD_Already_Updated = false;
+}
+
+
+
+/*********************************************************************************************************
+*										MPU6050内部函数
+*********************************************************************************************************/
+void MPU6050_Process(void) {
+	//mpu6050开始运作
+        MPU_Get_Accelerometer(&aacx, &aacy, &aacz);	//得到加速度传感器数据
+        Get_Arm_Position(&aacx, &aacy, &aacz, &Arm_Position, &Raised_Flag);
+        Reversed_Flag = Judge_Wrist_Reverse(&aacx, &aacy, &aacz, &Arm_Position);
+		printf("acel:%-10d%-10d%-10d\t",aacx, aacy, aacz);
+		printf((Arm_Position == 1 ? "PUTUP\n" : "LAYDOWN\n"));
+
+        if (Reversed_Flag == true) {
+            //此处执行手腕反转所需代码
+			BEEP();
+			printf("Reversed\n");
+            Reversed_Flag = false;
+        }
+
+        if (Raised_Flag == true) {
+            //此处执行抬手动作代码
+
+			printf("Raised\n");
+            Raised_Flag = false;
+        }
+        Stale_aacx_Data = aacx;
+        Stale_aacy_Data = aacy;
+		
+
+
+        //运作完成    delay 50 ms
+}
+
+void Get_Arm_Position(short* aacx, short* aacy, short* aacz, u8* Arm_Position, bool* Raised_Flag) {
+    if (*aacz > 12000) {
+        cnt_down = 0;
+        if (cnt_up++ == 5) {
+            cnt_up = 0;
+            *Arm_Position = PUT_UP;
+        }
+    }
+    if (*aacy > 12000) {
+        cnt_up = 0;
+        if (cnt_down++ == 5) {
+            cnt_down = 0;
+            *Arm_Position = LAY_DOWN;
+        }
+    }
+
+    if (*Arm_Position == LAY_DOWN) {
+        if (*aacy / 1000 <= Stale_aacy_Data / 1000 && *aacy < 10000) {
+            if (cnt_raising++ == 6) {
+                *Raised_Flag = true;
+                cnt_raising = 0;
+            }
+        } else cnt_raising = 0;
+    }
+}
+
+bool Judge_Wrist_Reverse(short* aacx, short* aacy, short* aacz, u8* Arm_Position) {
+    if (*Arm_Position == PUT_UP) {
+        if (*aacx < -11000 && *aacy < 3000 && *aacz > -5000) {
+            if (cnt_reverse >= 10)
+                Reverse_status = 2;
+            switch (Reverse_status)
+            {
+            case 0:
+                if (*aacx < Stale_aacx_Data)
+                    cnt_reverse++;
+                else if(*aacx < Stale_aacx_Data + 500)
+                    cnt_reverse++;
+                else{
+                    Reverse_status = 1;
+                    cnt_reverse++;
+                }
+                break;
+            
+            case 1:
+                if (*aacx > Stale_aacx_Data)
+                    cnt_reverse++;
+                else if (*aacx > Stale_aacx_Data - 500)
+                    cnt_reverse++;
+                if (cnt_reverse >= 4){
+                    cnt_reverse = 0;
+                    Reverse_status = 0;
+                    return true;
+                }
+                break;
+
+            case 2:
+                break;
+            }
+        } else {
+            cnt_reverse = 0;
+            Reverse_status = 0;
+        }
+    }
+    return false;
+}
+
+
+
+
+
+
+
+
+
+
